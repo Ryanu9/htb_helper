@@ -7,16 +7,66 @@ fn get_config_dir(app: &tauri::AppHandle) -> PathBuf {
     dir
 }
 
-// ── HTB API ──
+// ── HTB API ── Multi-token management ──
 
-fn load_htb_token(app: &tauri::AppHandle) -> String {
-    let path = get_config_dir(app).join("htb_token.txt");
-    std::fs::read_to_string(&path).unwrap_or_default().trim().to_string()
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct TokenEntry {
+    label: String,
+    token: String,
+    active: bool,
 }
 
-fn save_htb_token(app: &tauri::AppHandle, token: &str) -> Result<(), String> {
-    let path = get_config_dir(app).join("htb_token.txt");
-    std::fs::write(&path, token).map_err(|e| e.to_string())
+#[derive(serde::Serialize)]
+struct TokenInfo {
+    label: String,
+    token_preview: String,
+    active: bool,
+}
+
+fn tokens_path(app: &tauri::AppHandle) -> PathBuf {
+    get_config_dir(app).join("htb_tokens.json")
+}
+
+fn load_all_tokens(app: &tauri::AppHandle) -> Vec<TokenEntry> {
+    let path = tokens_path(app);
+    if path.exists() {
+        let data = std::fs::read_to_string(&path).unwrap_or_default();
+        serde_json::from_str::<Vec<TokenEntry>>(&data).unwrap_or_default()
+    } else {
+        // migrate from legacy htb_token.txt
+        let legacy = get_config_dir(app).join("htb_token.txt");
+        if legacy.exists() {
+            let t = std::fs::read_to_string(&legacy).unwrap_or_default().trim().to_string();
+            if !t.is_empty() {
+                let entries = vec![TokenEntry { label: "Default".into(), token: t, active: true }];
+                let _ = save_all_tokens(app, &entries);
+                return entries;
+            }
+        }
+        Vec::new()
+    }
+}
+
+fn save_all_tokens(app: &tauri::AppHandle, tokens: &[TokenEntry]) -> Result<(), String> {
+    let path = tokens_path(app);
+    let data = serde_json::to_string_pretty(tokens).map_err(|e| e.to_string())?;
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
+fn load_htb_token(app: &tauri::AppHandle) -> String {
+    load_all_tokens(app)
+        .iter()
+        .find(|t| t.active)
+        .map(|t| t.token.clone())
+        .unwrap_or_default()
+}
+
+fn mask_token(token: &str) -> String {
+    if token.len() <= 8 {
+        "****".to_string()
+    } else {
+        format!("{}…{}", &token[..4], &token[token.len()-4..])
+    }
 }
 
 #[tauri::command]
@@ -26,7 +76,73 @@ fn get_htb_token(app: tauri::AppHandle) -> String {
 
 #[tauri::command]
 fn set_htb_token(app: tauri::AppHandle, token: String) -> Result<(), String> {
-    save_htb_token(&app, &token)
+    // legacy compat: if called, upsert a "Default" entry
+    let mut tokens = load_all_tokens(&app);
+    if let Some(entry) = tokens.iter_mut().find(|t| t.label == "Default") {
+        entry.token = token;
+        for t in tokens.iter_mut() { t.active = t.label == "Default"; }
+    } else {
+        for t in tokens.iter_mut() { t.active = false; }
+        tokens.push(TokenEntry { label: "Default".into(), token, active: true });
+    }
+    save_all_tokens(&app, &tokens)
+}
+
+#[tauri::command]
+fn get_htb_tokens(app: tauri::AppHandle) -> Vec<TokenInfo> {
+    load_all_tokens(&app)
+        .iter()
+        .map(|t| TokenInfo {
+            label: t.label.clone(),
+            token_preview: mask_token(&t.token),
+            active: t.active,
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn add_htb_token(app: tauri::AppHandle, label: String, token: String) -> Result<Vec<TokenInfo>, String> {
+    let mut tokens = load_all_tokens(&app);
+    // no duplicate labels
+    if tokens.iter().any(|t| t.label == label) {
+        return Err(format!("Label '{}' already exists", label));
+    }
+    let is_first = tokens.is_empty();
+    if is_first {
+        tokens.push(TokenEntry { label, token, active: true });
+    } else {
+        tokens.push(TokenEntry { label, token, active: false });
+    }
+    save_all_tokens(&app, &tokens)?;
+    Ok(get_htb_tokens(app))
+}
+
+#[tauri::command]
+fn remove_htb_token(app: tauri::AppHandle, label: String) -> Result<Vec<TokenInfo>, String> {
+    let mut tokens = load_all_tokens(&app);
+    let was_active = tokens.iter().find(|t| t.label == label).map_or(false, |t| t.active);
+    tokens.retain(|t| t.label != label);
+    // if removed the active one, activate first remaining
+    if was_active {
+        if let Some(first) = tokens.first_mut() {
+            first.active = true;
+        }
+    }
+    save_all_tokens(&app, &tokens)?;
+    Ok(get_htb_tokens(app))
+}
+
+#[tauri::command]
+fn switch_htb_token(app: tauri::AppHandle, label: String) -> Result<Vec<TokenInfo>, String> {
+    let mut tokens = load_all_tokens(&app);
+    if !tokens.iter().any(|t| t.label == label) {
+        return Err(format!("Token '{}' not found", label));
+    }
+    for t in tokens.iter_mut() {
+        t.active = t.label == label;
+    }
+    save_all_tokens(&app, &tokens)?;
+    Ok(get_htb_tokens(app))
 }
 
 fn htb_client(token: &str) -> reqwest::Client {
@@ -463,6 +579,7 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_htb_token, set_htb_token,
+            get_htb_tokens, add_htb_token, remove_htb_token, switch_htb_token,
             htb_get_active_machine, htb_get_machine,
             htb_submit_flag,
             htb_spawn_machine, htb_reset_machine, htb_stop_machine, htb_extend_machine,

@@ -20,6 +20,8 @@ import {
   Flag,
   ClipboardPaste,
   Download,
+  Plus,
+  Trash2,
 } from "lucide-react";
 
 interface ActiveMachine {
@@ -59,6 +61,12 @@ interface ActionResult {
   message: string;
 }
 
+interface TokenInfo {
+  label: string;
+  token_preview: string;
+  active: boolean;
+}
+
 interface VpnServer {
   id: number;
   name: string;
@@ -73,6 +81,9 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
   const [tokenSaved, setTokenSaved] = useState(false);
   const [showTokenModal, setShowTokenModal] = useState(false);
   const [tokenInput, setTokenInput] = useState("");
+  const [tokenLabelInput, setTokenLabelInput] = useState("");
+  const [tokenList, setTokenList] = useState<TokenInfo[]>([]);
+  const [showAddForm, setShowAddForm] = useState(false);
 
   const [activeMachine, setActiveMachine] = useState<ActiveMachine | null>(null);
   const [loading, setLoading] = useState(false);
@@ -103,10 +114,16 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
-    invoke<string>("get_htb_token").then((t) => {
-      setToken(t);
-      setTokenSaved(!!t);
-      if (t) fetchActive(t);
+    invoke<TokenInfo[]>("get_htb_tokens").then((list) => {
+      setTokenList(list);
+      const active = list.find((t) => t.active);
+      if (active) {
+        invoke<string>("get_htb_token").then((t) => {
+          setToken(t);
+          setTokenSaved(true);
+          fetchActive(t);
+        });
+      }
     });
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -140,13 +157,56 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
     }
   }, [token]);
 
-  async function handleSaveToken() {
+  async function handleAddToken() {
+    const label = tokenLabelInput.trim();
+    const tk = tokenInput.trim();
+    if (!label || !tk) return;
     try {
-      await invoke("set_htb_token", { token: tokenInput });
-      setToken(tokenInput);
+      const list = await invoke<TokenInfo[]>("add_htb_token", { label, token: tk });
+      setTokenList(list);
+      setTokenInput("");
+      setTokenLabelInput("");
+      setShowAddForm(false);
+      // if it's the first token, it becomes active automatically
+      const active = list.find((t) => t.active);
+      if (active) {
+        const t = await invoke<string>("get_htb_token");
+        setToken(t);
+        setTokenSaved(true);
+        fetchActive(t);
+      }
+    } catch (e: any) {
+      setError(String(e));
+    }
+  }
+
+  async function handleSwitchToken(label: string) {
+    try {
+      const list = await invoke<TokenInfo[]>("switch_htb_token", { label });
+      setTokenList(list);
+      const t = await invoke<string>("get_htb_token");
+      setToken(t);
       setTokenSaved(true);
-      setShowTokenModal(false);
-      fetchActive(tokenInput);
+      setActiveMachine(null);
+      fetchActive(t);
+    } catch (e: any) {
+      setError(String(e));
+    }
+  }
+
+  async function handleRemoveToken(label: string) {
+    try {
+      const list = await invoke<TokenInfo[]>("remove_htb_token", { label });
+      setTokenList(list);
+      if (list.length === 0) {
+        setToken("");
+        setTokenSaved(false);
+        setActiveMachine(null);
+      } else {
+        const t = await invoke<string>("get_htb_token");
+        setToken(t);
+        fetchActive(t);
+      }
     } catch (e: any) {
       setError(String(e));
     }
@@ -397,11 +457,14 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
       {isActive && headerTarget && createPortal(
         <div className="flex items-center gap-2">
           <button
-            onClick={() => { setTokenInput(token); setShowTokenModal(true); }}
+            onClick={() => {
+              invoke<TokenInfo[]>("get_htb_tokens").then((list) => setTokenList(list));
+              setShowTokenModal(true);
+            }}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-surface-alt text-text-muted hover:bg-border hover:text-text text-xs font-medium transition-colors cursor-pointer"
           >
             <Settings className="w-3.5 h-3.5" />
-            API Token
+            {tokenList.find((t) => t.active)?.label || "API Token"}
             {tokenSaved && (
               <span className="ml-0.5 px-1.5 py-0.5 rounded-full bg-emerald-600 text-white text-[10px] font-bold leading-none">
                 ✓
@@ -438,10 +501,14 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
           <Monitor className="w-12 h-12 mx-auto text-text-muted mb-4" />
           <p className="text-text-muted mb-4">HTB API Token 未配置</p>
           <button
-            onClick={() => setShowTokenModal(true)}
+            onClick={() => {
+              invoke<TokenInfo[]>("get_htb_tokens").then((list) => setTokenList(list));
+              setShowAddForm(true);
+              setShowTokenModal(true);
+            }}
             className="px-5 py-2.5 bg-green-600 text-white rounded-xl text-sm font-medium hover:bg-green-700 transition-colors cursor-pointer"
           >
-            配置 API Token
+            Configure API Token
           </button>
         </div>
       )}
@@ -902,38 +969,108 @@ export default function HtbMachine({ isActive }: { isActive: boolean }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
           <div className="bg-white rounded-2xl shadow-xl w-full max-w-md mx-4 overflow-hidden">
             <div className="flex items-center justify-between px-5 py-3 border-b border-border bg-surface-alt">
-              <h3 className="text-sm font-semibold text-text">HTB API Token</h3>
-              <button onClick={() => setShowTokenModal(false)} className="p-1 rounded-lg hover:bg-border transition-colors cursor-pointer">
+              <h3 className="text-sm font-semibold text-text">HTB API Tokens</h3>
+              <button onClick={() => { setShowTokenModal(false); setShowAddForm(false); }} className="p-1 rounded-lg hover:bg-border transition-colors cursor-pointer">
                 <X className="w-4 h-4 text-text-muted" />
               </button>
             </div>
             <div className="p-5 space-y-4">
               <p className="text-xs text-text-muted">
-                Enter your Hack The Box API token. You can find it at{" "}
+                Manage your Hack The Box API tokens. Get yours at{" "}
                 <span className="font-mono text-primary">https://app.hackthebox.com/profile/settings</span>
               </p>
-              <input
-                type="password"
-                value={tokenInput}
-                onChange={(e) => setTokenInput(e.target.value)}
-                placeholder="eyJ0eXAiOiJKV1Qi..."
-                className="w-full px-4 py-2.5 rounded-lg border border-border bg-white text-text font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition-all"
-              />
-              <div className="flex justify-end gap-2">
+
+              {/* Token List */}
+              {tokenList.length > 0 && (
+                <div className="rounded-lg border border-border overflow-hidden">
+                  {tokenList.map((t) => (
+                    <div
+                      key={t.label}
+                      className={`flex items-center gap-3 px-3 py-2.5 border-b border-border last:border-b-0 transition-colors ${
+                        t.active ? "bg-emerald-50" : "hover:bg-surface-alt"
+                      }`}
+                    >
+                      <button
+                        onClick={() => !t.active && handleSwitchToken(t.label)}
+                        className="shrink-0 cursor-pointer"
+                      >
+                        <div className={`w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                          t.active
+                            ? "border-emerald-600 bg-emerald-600"
+                            : "border-gray-300 hover:border-emerald-400"
+                        }`}>
+                          {t.active && <Check className="w-2.5 h-2.5 text-white" />}
+                        </div>
+                      </button>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-text truncate">{t.label}</div>
+                        <div className="text-[11px] font-mono text-text-muted">{t.token_preview}</div>
+                      </div>
+                      {t.active && (
+                        <span className="shrink-0 px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[9px] font-bold leading-none">
+                          ACTIVE
+                        </span>
+                      )}
+                      <button
+                        onClick={() => handleRemoveToken(t.label)}
+                        className="shrink-0 p-1 rounded hover:bg-red-100 text-text-muted hover:text-red-600 transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {tokenList.length === 0 && !showAddForm && (
+                <div className="text-center py-4 text-text-muted text-sm">
+                  No tokens configured yet.
+                </div>
+              )}
+
+              {/* Add Token Form */}
+              {showAddForm ? (
+                <div className="space-y-3 p-3 rounded-lg border border-border bg-surface-alt">
+                  <input
+                    type="text"
+                    value={tokenLabelInput}
+                    onChange={(e) => setTokenLabelInput(e.target.value)}
+                    placeholder="Label (e.g. Main Account)"
+                    className="w-full px-3 py-2 rounded-lg border border-border bg-white text-text text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition-all"
+                  />
+                  <input
+                    type="password"
+                    value={tokenInput}
+                    onChange={(e) => setTokenInput(e.target.value)}
+                    placeholder="eyJ0eXAiOiJKV1Qi..."
+                    className="w-full px-3 py-2 rounded-lg border border-border bg-white text-text font-mono text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition-all"
+                    onKeyDown={(e) => e.key === "Enter" && handleAddToken()}
+                  />
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => { setShowAddForm(false); setTokenInput(""); setTokenLabelInput(""); }}
+                      className="px-3 py-1.5 rounded-lg text-xs text-text-muted hover:bg-border transition-colors cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleAddToken}
+                      disabled={!tokenInput.trim() || !tokenLabelInput.trim()}
+                      className="px-4 py-1.5 bg-green-600 text-white rounded-lg text-xs font-medium hover:bg-green-700 disabled:opacity-40 transition-colors cursor-pointer"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </div>
+              ) : (
                 <button
-                  onClick={() => setShowTokenModal(false)}
-                  className="px-4 py-2 rounded-lg text-sm text-text-muted hover:bg-surface-alt transition-colors cursor-pointer"
+                  onClick={() => setShowAddForm(true)}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm text-primary hover:bg-surface-alt transition-colors cursor-pointer w-full justify-center border border-dashed border-border"
                 >
-                  Cancel
+                  <Plus className="w-4 h-4" />
+                  Add Token
                 </button>
-                <button
-                  onClick={handleSaveToken}
-                  disabled={!tokenInput.trim()}
-                  className="px-5 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-40 transition-colors cursor-pointer"
-                >
-                  Save
-                </button>
-              </div>
+              )}
             </div>
           </div>
         </div>
