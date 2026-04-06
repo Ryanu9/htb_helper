@@ -545,13 +545,65 @@ async fn htb_get_vpn_servers(app: tauri::AppHandle, product: String) -> Result<V
     Ok(servers)
 }
 
-#[tauri::command]
-async fn htb_download_vpn(app: tauri::AppHandle, vpn_server_id: i64, tcp: bool, save_path: String) -> Result<HtbActionResult, String> {
-    let token = load_htb_token(&app);
-    if token.is_empty() {
-        return Err("HTB API Token not configured".into());
+fn htb_response_preview(text: &str, fallback: &str) -> String {
+    if text.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        text[..text.len().min(200)].to_string()
     }
-    let client = htb_client(&token);
+}
+
+fn htb_response_message(text: &str, fallback: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(if text.trim().is_empty() { "{}" } else { text })
+        .ok()
+        .and_then(|body| body["message"].as_str().map(|message| message.to_string()))
+        .unwrap_or_else(|| htb_response_preview(text, fallback))
+}
+
+fn is_vpn_not_assigned_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("you are not assigned")
+}
+
+async fn htb_switch_vpn_server_request(client: &reqwest::Client, vpn_server_id: i64) -> Result<Result<(), HtbActionResult>, String> {
+    let url = format!("{}connections/servers/switch/{}", HTB_API_BASE, vpn_server_id);
+    let resp = client.post(&url).send().await.map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let body = serde_json::from_str::<serde_json::Value>(if text.trim().is_empty() { "{}" } else { &text }).ok();
+    let message = body
+        .as_ref()
+        .and_then(|value| value["message"].as_str())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| htb_response_preview(&text, "Could not switch VPN Server."));
+
+    if !status.is_success() {
+        return Ok(Err(HtbActionResult {
+            success: false,
+            message: format!("HTTP {}: {}", status.as_u16(), message),
+        }));
+    }
+
+    let switch_succeeded = body
+        .as_ref()
+        .and_then(|value| {
+            value["status"]
+                .as_bool()
+                .or_else(|| value["status"].as_i64().map(|status| status != 0))
+                .or_else(|| value["status"].as_str().map(|status| status != "0" && !status.eq_ignore_ascii_case("false")))
+        })
+        .unwrap_or(true);
+
+    if !switch_succeeded {
+        return Ok(Err(HtbActionResult {
+            success: false,
+            message,
+        }));
+    }
+
+    Ok(Ok(()))
+}
+
+async fn htb_download_vpn_bytes(client: &reqwest::Client, vpn_server_id: i64, tcp: bool) -> Result<Result<Vec<u8>, HtbActionResult>, String> {
     let url = if tcp {
         format!("{}access/ovpnfile/{}/0/1", HTB_API_BASE, vpn_server_id)
     } else {
@@ -561,17 +613,47 @@ async fn htb_download_vpn(app: tauri::AppHandle, vpn_server_id: i64, tcp: bool, 
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        return Ok(HtbActionResult {
+        return Ok(Err(HtbActionResult {
             success: false,
-            message: format!("HTTP {}: {}", status.as_u16(), &text[..text.len().min(200)]),
-        });
+            message: format!("HTTP {}: {}", status.as_u16(), htb_response_message(&text, "VPN download failed")),
+        }));
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    std::fs::write(&save_path, &bytes).map_err(|e| format!("Failed to save file: {}", e))?;
-    Ok(HtbActionResult {
-        success: true,
-        message: format!("VPN file saved to {}", save_path),
-    })
+    Ok(Ok(bytes.to_vec()))
+}
+
+#[tauri::command]
+async fn htb_download_vpn(app: tauri::AppHandle, vpn_server_id: i64, tcp: bool, save_path: String) -> Result<HtbActionResult, String> {
+    let token = load_htb_token(&app);
+    if token.is_empty() {
+        return Err("HTB API Token not configured".into());
+    }
+    let client = htb_client(&token);
+    let mut switch_retries = 0;
+
+    loop {
+        match htb_download_vpn_bytes(&client, vpn_server_id, tcp).await? {
+            Ok(bytes) => {
+                std::fs::write(&save_path, &bytes).map_err(|e| format!("Failed to save file: {}", e))?;
+                return Ok(HtbActionResult {
+                    success: true,
+                    message: format!("VPN file saved to {}", save_path),
+                });
+            }
+            Err(result) => {
+                if switch_retries >= 2 || !is_vpn_not_assigned_message(&result.message) {
+                    return Ok(result);
+                }
+
+                match htb_switch_vpn_server_request(&client, vpn_server_id).await? {
+                    Ok(()) => {
+                        switch_retries += 1;
+                    }
+                    Err(result) => return Ok(result),
+                }
+            }
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
